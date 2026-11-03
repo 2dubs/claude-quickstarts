@@ -51,6 +51,15 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+### Prompt caching
+
+The finance API route marks the system prompt with `cache_control` so the tool
+definitions and system prompt (the same on every request) are cached for five
+minutes after each use. Cached prefix tokens are billed at a fraction of the
+normal input price and skip prefill, so follow-up questions in a session are
+cheaper and start responding sooner. The route logs `cacheReadInputTokens` and
+`cacheHitRate` for every request so you can confirm caching is working.
+
 ## Technology Stack
 
 - **Frontend**:
