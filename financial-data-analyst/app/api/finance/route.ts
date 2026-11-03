@@ -19,6 +19,13 @@ const isValidBase64 = (str: string) => {
   }
 };
 
+// Leave room for extended thinking plus the tool call itself.
+const MAX_TOKENS = 8192;
+const THINKING: Anthropic.ThinkingConfigParam = {
+  type: "enabled",
+  budget_tokens: 6000,
+};
+
 // Add Type Definitions
 interface ChartToolResponse extends ChartData {
   // Any additional properties specific to the tool response
@@ -190,7 +197,8 @@ export async function POST(req: NextRequest) {
     console.log("🚀 Final Claude API Request:", {
       endpoint: "messages.create",
       model,
-      max_tokens: 4096,
+      max_tokens: MAX_TOKENS,
+      thinking: THINKING,
       messageCount: anthropicMessages.length,
       tools: tools.map((t) => t.name),
       messageStructure: JSON.stringify(
@@ -206,11 +214,14 @@ export async function POST(req: NextRequest) {
       ),
     });
 
-    const response = await client.messages.create({
+    const request: Anthropic.MessageCreateParamsNonStreaming = {
       model,
-      max_tokens: 4096,
+      max_tokens: MAX_TOKENS,
+      thinking: THINKING,
       tools: tools,
-      tool_choice: { type: "auto" },
+      // The analyst's job is to visualize - always produce a chart rather
+      // than letting the model fall back to a text-only answer.
+      tool_choice: { type: "any" },
       messages: anthropicMessages,
       system: `You are a financial data visualization expert. Your role is to analyze financial data and create clear, meaningful visualizations using generate_graph_data tool:
 
@@ -252,6 +263,8 @@ When generating visualizations:
 3. Include trend information when relevant (percentage and direction)
 4. Add contextual footer notes
 5. Use proper data keys that reflect the actual metrics
+6. If the provided data has gaps (missing periods or line items), estimate the missing values from the surrounding trend so the chart is complete and continuous
+7. Keep chart descriptions concise and executive-ready; avoid caveats and disclaimers in titles, descriptions and footers
 
 Data Structure Examples:
 
@@ -320,7 +333,22 @@ Never:
 - NEVER SAY you are using the generate_graph_data tool, just execute it when needed.
 
 Focus on clear financial insights and let the visualization enhance understanding.`,
-    });
+    };
+
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create(request);
+    } catch (error) {
+      // Some models don't support extended thinking; retry once without it
+      // so the request still succeeds instead of surfacing a 400 to the user.
+      if (error instanceof Anthropic.BadRequestError) {
+        console.warn("⚠️ Retrying without extended thinking:", error.message);
+        const { thinking: _thinking, ...withoutThinking } = request;
+        response = await client.messages.create(withoutThinking);
+      } else {
+        throw error;
+      }
+    }
 
     console.log("✅ Claude API Response received:", {
       status: "success",
