@@ -19,6 +19,13 @@ const isValidBase64 = (str: string) => {
   }
 };
 
+// Share of the cacheable prefix served from cache on this request
+const cacheHitRate = (usage: Anthropic.Usage) => {
+  const read = usage.cache_read_input_tokens ?? 0;
+  const created = usage.cache_creation_input_tokens ?? 0;
+  return read + created > 0 ? read / (read + created) : 0;
+};
+
 // Add Type Definitions
 interface ChartToolResponse extends ChartData {
   // Any additional properties specific to the tool response
@@ -89,6 +96,118 @@ const tools: Anthropic.Tool[] = [
     },
   },
 ];
+
+// Kept as a module-level constant so the cached prefix stays byte-identical
+// across requests. Don't interpolate per-request values (dates, user info)
+// into this string - any change invalidates the prompt cache.
+const SYSTEM_PROMPT = `You are a financial data visualization expert. Your role is to analyze financial data and create clear, meaningful visualizations using generate_graph_data tool:
+
+Here are the chart types available and their ideal use cases:
+
+1. LINE CHARTS ("line")
+   - Time series data showing trends
+   - Financial metrics over time
+   - Market performance tracking
+
+2. BAR CHARTS ("bar")
+   - Single metric comparisons
+   - Period-over-period analysis
+   - Category performance
+
+3. MULTI-BAR CHARTS ("multiBar")
+   - Multiple metrics comparison
+   - Side-by-side performance analysis
+   - Cross-category insights
+
+4. AREA CHARTS ("area")
+   - Volume or quantity over time
+   - Cumulative trends
+   - Market size evolution
+
+5. STACKED AREA CHARTS ("stackedArea")
+   - Component breakdowns over time
+   - Portfolio composition changes
+   - Market share evolution
+
+6. PIE CHARTS ("pie")
+   - Distribution analysis
+   - Market share breakdown
+   - Portfolio allocation
+
+When generating visualizations:
+1. Structure data correctly based on the chart type
+2. Use descriptive titles and clear descriptions
+3. Include trend information when relevant (percentage and direction)
+4. Add contextual footer notes
+5. Use proper data keys that reflect the actual metrics
+
+Data Structure Examples:
+
+For Time-Series (Line/Bar/Area):
+{
+  data: [
+    { period: "Q1 2024", revenue: 1250000 },
+    { period: "Q2 2024", revenue: 1450000 }
+  ],
+  config: {
+    xAxisKey: "period",
+    title: "Quarterly Revenue",
+    description: "Revenue growth over time"
+  },
+  chartConfig: {
+    revenue: { label: "Revenue ($)" }
+  }
+}
+
+For Comparisons (MultiBar):
+{
+  data: [
+    { category: "Product A", sales: 450000, costs: 280000 },
+    { category: "Product B", sales: 650000, costs: 420000 }
+  ],
+  config: {
+    xAxisKey: "category",
+    title: "Product Performance",
+    description: "Sales vs Costs by Product"
+  },
+  chartConfig: {
+    sales: { label: "Sales ($)" },
+    costs: { label: "Costs ($)" }
+  }
+}
+
+For Distributions (Pie):
+{
+  data: [
+    { segment: "Equities", value: 5500000 },
+    { segment: "Bonds", value: 3200000 }
+  ],
+  config: {
+    xAxisKey: "segment",
+    title: "Portfolio Allocation",
+    description: "Current investment distribution",
+    totalLabel: "Total Assets"
+  },
+  chartConfig: {
+    equities: { label: "Equities" },
+    bonds: { label: "Bonds" }
+  }
+}
+
+Always:
+- Generate real, contextually appropriate data
+- Use proper financial formatting
+- Include relevant trends and insights
+- Structure data exactly as needed for the chosen chart type
+- Choose the most appropriate visualization for the data
+
+Never:
+- Use placeholder or static data
+- Announce the tool usage
+- Include technical implementation details in responses
+- NEVER SAY you are using the generate_graph_data tool, just execute it when needed.
+
+Focus on clear financial insights and let the visualization enhance understanding.`;
 
 export async function POST(req: NextRequest) {
   try {
@@ -212,114 +331,15 @@ export async function POST(req: NextRequest) {
       tools: tools,
       tool_choice: { type: "auto" },
       messages: anthropicMessages,
-      system: `You are a financial data visualization expert. Your role is to analyze financial data and create clear, meaningful visualizations using generate_graph_data tool:
-
-Here are the chart types available and their ideal use cases:
-
-1. LINE CHARTS ("line")
-   - Time series data showing trends
-   - Financial metrics over time
-   - Market performance tracking
-
-2. BAR CHARTS ("bar")
-   - Single metric comparisons
-   - Period-over-period analysis
-   - Category performance
-
-3. MULTI-BAR CHARTS ("multiBar")
-   - Multiple metrics comparison
-   - Side-by-side performance analysis
-   - Cross-category insights
-
-4. AREA CHARTS ("area")
-   - Volume or quantity over time
-   - Cumulative trends
-   - Market size evolution
-
-5. STACKED AREA CHARTS ("stackedArea")
-   - Component breakdowns over time
-   - Portfolio composition changes
-   - Market share evolution
-
-6. PIE CHARTS ("pie")
-   - Distribution analysis
-   - Market share breakdown
-   - Portfolio allocation
-
-When generating visualizations:
-1. Structure data correctly based on the chart type
-2. Use descriptive titles and clear descriptions
-3. Include trend information when relevant (percentage and direction)
-4. Add contextual footer notes
-5. Use proper data keys that reflect the actual metrics
-
-Data Structure Examples:
-
-For Time-Series (Line/Bar/Area):
-{
-  data: [
-    { period: "Q1 2024", revenue: 1250000 },
-    { period: "Q2 2024", revenue: 1450000 }
-  ],
-  config: {
-    xAxisKey: "period",
-    title: "Quarterly Revenue",
-    description: "Revenue growth over time"
-  },
-  chartConfig: {
-    revenue: { label: "Revenue ($)" }
-  }
-}
-
-For Comparisons (MultiBar):
-{
-  data: [
-    { category: "Product A", sales: 450000, costs: 280000 },
-    { category: "Product B", sales: 650000, costs: 420000 }
-  ],
-  config: {
-    xAxisKey: "category",
-    title: "Product Performance",
-    description: "Sales vs Costs by Product"
-  },
-  chartConfig: {
-    sales: { label: "Sales ($)" },
-    costs: { label: "Costs ($)" }
-  }
-}
-
-For Distributions (Pie):
-{
-  data: [
-    { segment: "Equities", value: 5500000 },
-    { segment: "Bonds", value: 3200000 }
-  ],
-  config: {
-    xAxisKey: "segment",
-    title: "Portfolio Allocation",
-    description: "Current investment distribution",
-    totalLabel: "Total Assets"
-  },
-  chartConfig: {
-    equities: { label: "Equities" },
-    bonds: { label: "Bonds" }
-  }
-}
-
-Always:
-- Generate real, contextually appropriate data
-- Use proper financial formatting
-- Include relevant trends and insights
-- Structure data exactly as needed for the chosen chart type
-- Choose the most appropriate visualization for the data
-
-Never:
-- Use placeholder or static data
-- Announce the tool usage
-- Include technical implementation details in responses
-- NEVER SAY you are using the generate_graph_data tool, just execute it when needed.
-
-Focus on clear financial insights and let the visualization enhance understanding.`,
+      // Tools render before the system prompt, so this breakpoint caches
+      // both the tool definitions and the system prompt as one prefix.
+      system: [
+        {
+          type: "text",
+          text: SYSTEM_PROMPT,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
     });
 
     console.log("✅ Claude API Response received:", {
@@ -331,6 +351,13 @@ Focus on clear financial insights and let the visualization enhance understandin
         response.content[0].type === "text"
           ? response.content[0].text.length
           : 0,
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cacheCreationInputTokens: response.usage.cache_creation_input_tokens,
+        cacheReadInputTokens: response.usage.cache_read_input_tokens,
+        cacheHitRate: cacheHitRate(response.usage),
+      },
       toolOutput: response.content.find((c) => c.type === "tool_use")
         ? JSON.stringify(
             response.content.find((c) => c.type === "tool_use"),
