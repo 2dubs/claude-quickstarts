@@ -2,6 +2,7 @@
 import { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import type { ChartData } from "@/types/chart";
+import { encodeSSE, type FinanceStreamEvent } from "@/lib/sse";
 
 // Initialize the Anthropic client
 const client = new Anthropic({
@@ -89,6 +90,54 @@ const tools: Anthropic.Tool[] = [
     },
   },
 ];
+
+const processToolResponse = (toolUseContent: Anthropic.ToolUseBlock) => {
+  const chartData = toolUseContent.input as ChartToolResponse;
+
+  if (
+    !chartData.chartType ||
+    !chartData.data ||
+    !Array.isArray(chartData.data)
+  ) {
+    throw new Error("Invalid chart data structure");
+  }
+
+  // Transform data for pie charts to match expected structure
+  if (chartData.chartType === "pie") {
+    // Ensure data items have 'segment' and 'value' keys
+    chartData.data = chartData.data.map((item) => {
+      // Find the first key in chartConfig (e.g., 'sales')
+      const valueKey = Object.keys(chartData.chartConfig)[0];
+      const segmentKey = chartData.config.xAxisKey || "segment";
+
+      return {
+        segment: item[segmentKey] || item.segment || item.category || item.name,
+        value: item[valueKey] || item.value,
+      };
+    });
+
+    // Ensure xAxisKey is set to 'segment' for consistency
+    chartData.config.xAxisKey = "segment";
+  }
+
+  // Create new chartConfig with system color variables
+  const processedChartConfig = Object.entries(chartData.chartConfig).reduce(
+    (acc, [key, config], index) => ({
+      ...acc,
+      [key]: {
+        ...config,
+        // Assign color variables sequentially
+        color: `hsl(var(--chart-${index + 1}))`,
+      },
+    }),
+    {},
+  );
+
+  return {
+    ...chartData,
+    chartConfig: processedChartConfig,
+  };
+};
 
 export async function POST(req: NextRequest) {
   try {
@@ -206,10 +255,12 @@ export async function POST(req: NextRequest) {
       ),
     });
 
-    const response = await client.messages.create({
+    const stream = client.messages.stream({
       model,
       max_tokens: 4096,
-      tools: tools,
+      // Stream tool input as it is generated instead of buffering it, so
+      // chart data starts flowing as early as possible.
+      tools: tools.map((tool) => ({ ...tool, eager_input_streaming: true })),
       tool_choice: { type: "auto" },
       messages: anthropicMessages,
       system: `You are a financial data visualization expert. Your role is to analyze financial data and create clear, meaningful visualizations using generate_graph_data tool:
@@ -322,98 +373,56 @@ Never:
 Focus on clear financial insights and let the visualization enhance understanding.`,
     });
 
-    console.log("✅ Claude API Response received:", {
-      status: "success",
-      stopReason: response.stop_reason,
-      hasToolUse: response.content.some((c) => c.type === "tool_use"),
-      contentTypes: response.content.map((c) => c.type),
-      contentLength:
-        response.content[0].type === "text"
-          ? response.content[0].text.length
-          : 0,
-      toolOutput: response.content.find((c) => c.type === "tool_use")
-        ? JSON.stringify(
-            response.content.find((c) => c.type === "tool_use"),
-            null,
-            2,
-          )
-        : "No tool used",
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: FinanceStreamEvent) =>
+          controller.enqueue(encoder.encode(encodeSSE(event)));
+
+        // Flush an initial event right away so the client gets its first
+        // byte without waiting on the model.
+        send({ type: "start" });
+
+        stream.on("text", (text) => send({ type: "text", text }));
+
+        try {
+          const message = await stream.finalMessage();
+
+          console.log("✅ Claude API Response received:", {
+            status: "success",
+            stopReason: message.stop_reason,
+            contentTypes: message.content.map((c) => c.type),
+            usage: message.usage,
+          });
+
+          const toolUseContent = message.content.find(
+            (c): c is Anthropic.ToolUseBlock => c.type === "tool_use",
+          );
+
+          if (toolUseContent) {
+            send({
+              type: "chart",
+              chartData: processToolResponse(toolUseContent),
+              toolUse: toolUseContent,
+            });
+          }
+
+          send({ type: "done" });
+        } catch (error) {
+          console.error("❌ Finance stream error:", error);
+        } finally {
+          controller.close();
+        }
+      },
     });
 
-    const toolUseContent = response.content.find(
-      (c): c is Anthropic.ToolUseBlock => c.type === "tool_use",
-    );
-    const textContent = response.content.find(
-      (c): c is Anthropic.TextBlock => c.type === "text",
-    );
-
-    const processToolResponse = (toolUseContent: Anthropic.ToolUseBlock) => {
-      const chartData = toolUseContent.input as ChartToolResponse;
-
-      if (
-        !chartData.chartType ||
-        !chartData.data ||
-        !Array.isArray(chartData.data)
-      ) {
-        throw new Error("Invalid chart data structure");
-      }
-
-      // Transform data for pie charts to match expected structure
-      if (chartData.chartType === "pie") {
-        // Ensure data items have 'segment' and 'value' keys
-        chartData.data = chartData.data.map((item) => {
-          // Find the first key in chartConfig (e.g., 'sales')
-          const valueKey = Object.keys(chartData.chartConfig)[0];
-          const segmentKey = chartData.config.xAxisKey || "segment";
-
-          return {
-            segment:
-              item[segmentKey] || item.segment || item.category || item.name,
-            value: item[valueKey] || item.value,
-          };
-        });
-
-        // Ensure xAxisKey is set to 'segment' for consistency
-        chartData.config.xAxisKey = "segment";
-      }
-
-      // Create new chartConfig with system color variables
-      const processedChartConfig = Object.entries(chartData.chartConfig).reduce(
-        (acc, [key, config], index) => ({
-          ...acc,
-          [key]: {
-            ...config,
-            // Assign color variables sequentially
-            color: `hsl(var(--chart-${index + 1}))`,
-          },
-        }),
-        {},
-      );
-
-      return {
-        ...chartData,
-        chartConfig: processedChartConfig,
-      };
-    };
-
-    const processedChartData = toolUseContent
-      ? processToolResponse(toolUseContent)
-      : null;
-
-    return new Response(
-      JSON.stringify({
-        content: textContent?.text || "",
-        hasToolUse: response.content.some((c) => c.type === "tool_use"),
-        toolUse: toolUseContent,
-        chartData: processedChartData,
-      }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-cache",
-        },
+    return new Response(body, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
       },
-    );
+    });
   } catch (error) {
     console.error("❌ Finance API Error: ", error);
     console.error("Full error details:", {

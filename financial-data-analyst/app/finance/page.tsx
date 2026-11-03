@@ -40,6 +40,7 @@ import {
   readFileAsBase64,
   readFileAsPDFText,
 } from "@/utils/fileHandling";
+import { parseSSEChunk } from "@/lib/sse";
 
 // Types
 interface Message {
@@ -73,19 +74,6 @@ const models: Model[] = [
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
   { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
 ];
-
-// Updated APIResponse interface
-interface APIResponse {
-  content: string;
-  hasToolUse: boolean;
-  toolUse?: {
-    type: "tool_use";
-    id: string;
-    name: string;
-    input: ChartData;
-  };
-  chartData?: ChartData;
-}
 
 interface MessageComponentProps {
   message: Message;
@@ -442,21 +430,57 @@ export default function AIChat() {
         body: JSON.stringify(requestBody),
       });
 
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data: APIResponse = await response.json();
+      const assistantId = crypto.randomUUID();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let content = "";
+      let chartData: ChartData | undefined;
 
+      const updateAssistantMessage = () => {
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          newMessages[newMessages.length - 1] = {
+            id: assistantId,
+            role: "assistant",
+            // Keep the "thinking" placeholder until the first token arrives
+            content: content || "thinking",
+            hasToolUse: !!chartData,
+            chartData,
+          };
+          return newMessages;
+        });
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        for (const event of parseSSEChunk(
+          decoder.decode(value, { stream: true }),
+        )) {
+          if (event.type === "text") {
+            content += event.text;
+            updateAssistantMessage();
+          } else if (event.type === "chart") {
+            chartData = event.chartData;
+            updateAssistantMessage();
+          }
+        }
+      }
+
+      // Final update clears the placeholder even if no text was streamed
       setMessages((prev) => {
         const newMessages = [...prev];
         newMessages[newMessages.length - 1] = {
-          id: crypto.randomUUID(),
+          id: assistantId,
           role: "assistant",
-          content: data.content,
-          hasToolUse: data.hasToolUse || !!data.toolUse,
-          chartData:
-            data.chartData || (data.toolUse?.input as ChartData) || null,
+          content,
+          hasToolUse: !!chartData,
+          chartData,
         };
         return newMessages;
       });
